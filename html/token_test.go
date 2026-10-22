@@ -626,6 +626,16 @@ var tokenTests = []tokenTest{
 		`<p a=/>`,
 		`<p a="/">`,
 	},
+	{
+		"duplicate attributes",
+		`<p foo="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
+	{
+		"duplicate attributes, different case",
+		`<p FOO="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
 }
 
 func TestTokenizer(t *testing.T) {
@@ -933,3 +943,89 @@ func benchmarkTokenizer(b *testing.B, level int) {
 func BenchmarkRawLevelTokenizer(b *testing.B)  { benchmarkTokenizer(b, rawLevel) }
 func BenchmarkLowLevelTokenizer(b *testing.B)  { benchmarkTokenizer(b, lowLevel) }
 func BenchmarkHighLevelTokenizer(b *testing.B) { benchmarkTokenizer(b, highLevel) }
+
+func TestUnicodeAttributeCase(t *testing.T) {
+	// <div a="1" A="1"> is resolved to <div a="1"> because a and A are considered
+	// duplicate attribute names. Different unicode cases are not considered equal
+	// though, so <div ä="1" Ä="1"> is tokenized as <div ä="1" Ä="1">.
+	f := `<div ä="1" Ä="1">`
+	z := NewTokenizer(strings.NewReader(f))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("expected StartTagToken, got %s", tt)
+	}
+	tok := z.Token()
+	if len(tok.Attr) != 2 {
+		t.Fatalf("expected 2 attributes, got %d", len(tok.Attr))
+	}
+	if tok.Attr[0].Key != "ä" {
+		t.Errorf("expected attribute key to be 'ä', got %s", tok.Attr[0].Key)
+	}
+	if tok.Attr[1].Key != "Ä" {
+		t.Errorf("expected attribute key to be 'Ä', got %s", tok.Attr[1].Key)
+	}
+}
+
+func TestDuplicateAttributesParse(t *testing.T) {
+	// Only the first occurrence of a duplicated attribute is kept, as browsers
+	// do. Otherwise the parser may build a tree based on a later duplicate,
+	// which Render then emits in a form that browsers parse into a different
+	// tree, letting markup slip past HTML sanitizers.
+	var findElement func(n *Node, data string) *Node
+	findElement = func(n *Node, data string) *Node {
+		if n.Type == ElementNode && n.Data == data {
+			return n
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			if m := findElement(c, data); m != nil {
+				return m
+			}
+		}
+		return nil
+	}
+
+	t.Run("annotation-xml encoding", func(t *testing.T) {
+		src := `<math><annotation-xml encoding="x" encoding="text/html"><style><img src=x onerror=alert(1)></style></annotation-xml></math>`
+		doc, err := Parse(strings.NewReader(src))
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		ax := findElement(doc, "annotation-xml")
+		if ax == nil {
+			t.Fatal("annotation-xml element not found")
+		}
+		if want := []Attribute{{Key: "encoding", Val: "x"}}; !reflect.DeepEqual(ax.Attr, want) {
+			t.Errorf("annotation-xml attributes: got %v, want %v", ax.Attr, want)
+		}
+		// Since annotation-xml is not an HTML integration point, <img> breaks
+		// out of foreign content and becomes an element, as it does in browsers.
+		if img := findElement(doc, "img"); img == nil || img.Namespace != "" {
+			t.Errorf("expected <img> to be parsed as an HTML element, got %v", img)
+		}
+		var b bytes.Buffer
+		if err := Render(&b, doc); err != nil {
+			t.Fatalf("Render: %v", err)
+		}
+		if got := b.String(); strings.Contains(got, `encoding="text/html"`) {
+			t.Errorf("rendered output contains duplicate encoding attribute: %s", got)
+		}
+	})
+
+	t.Run("input type in table", func(t *testing.T) {
+		src := `<table><input type="text" type="hidden"></table>`
+		doc, err := Parse(strings.NewReader(src))
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		input := findElement(doc, "input")
+		if input == nil {
+			t.Fatal("input element not found")
+		}
+		if want := []Attribute{{Key: "type", Val: "text"}}; !reflect.DeepEqual(input.Attr, want) {
+			t.Errorf("input attributes: got %v, want %v", input.Attr, want)
+		}
+		// A non-hidden input is foster parented out of the table.
+		if input.Parent == nil || input.Parent.Data != "body" {
+			t.Errorf("expected input to be foster parented into body, got parent %v", input.Parent)
+		}
+	})
+}
